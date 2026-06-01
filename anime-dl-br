@@ -1,0 +1,1514 @@
+#!/home/ismaeldev/.local/venv/anime/bin/python3
+"""
+anime-dl-br — Download anime from Brazilian sources (AnimeFire, AnimesOnlineCC)
+Integrates with GoAnime's tracking DB and Plex naming convention.
+
+Usage:
+  anime-dl-br search <query> [--source animefire|animesonline] [--json]
+  anime-dl-br episodes <anime-slug> [--source animefire|animesonline]
+  anime-dl-br download <anime-title> <episode> [--source ...] [--quality best|720p|1080p] [--dir <path>]
+  anime-dl-br download <anime-title> --range 1-12 [--source ...]
+  anime-dl-br download <anime-title> --all [--source ...]
+"""
+
+import re
+import os
+import sys
+import json
+import time
+import html
+import argparse
+import subprocess
+import tempfile
+import shutil
+import sqlite3
+from urllib.parse import quote, urljoin
+from pathlib import Path
+
+# ── HTTP Session (curl_cffi > cloudscraper — same pattern as anime-dl) ──
+try:
+    from curl_cffi import requests
+    USE_CURL_CFFI = True
+except ImportError:
+    try:
+        import cloudscraper
+        USE_CURL_CFFI = False
+    except ImportError:
+        print("ERROR: Need curl_cffi or cloudscraper. Install with:")
+        print("  pip install curl_cffi cloudscraper")
+        sys.exit(1)
+
+# ── Playwright (optional, for Blogger JS-based video extraction) ──
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+
+# ── Constants ─────────────────────────────────────────────────────
+ANIMEFIRE_BASE = "https://animefire.io"
+ANIMESONLINE_BASE = "https://animesonlinecc.to"
+GOANIME_BIN = os.path.expanduser("~/.local/bin/goanime")
+GOANIME_DB = os.path.expanduser("~/.local/goanime/tracking/progress.db")
+DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/.local/goanime/downloads/anime")
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+YT_DLP_BIN = shutil.which("yt-dlp") or os.path.expanduser("~/.local/venv/anime/bin/yt-dlp")
+
+# ── Title cleanup ─────────────────────────────────────────────────
+
+def clean_title(title):
+    """Decode HTML entities and strip common suffixes for cleaner display."""
+    title = html.unescape(title).strip()
+    return title
+
+
+# ── Session helpers ───────────────────────────────────────────────
+
+def get_session():
+    """Create a session with Cloudflare bypass (curl_cffi or cloudscraper)."""
+    if USE_CURL_CFFI:
+        return requests.Session()
+    return cloudscraper.create_scraper()
+
+def http_get(session, url, **kwargs):
+    """GET with impersonation/headers matching existing anime-dl pattern."""
+    kwargs.setdefault('impersonate' if USE_CURL_CFFI else 'headers',
+                     'chrome120' if USE_CURL_CFFI else {'User-Agent': USER_AGENT})
+    kwargs.setdefault('timeout', 30)
+    return session.get(url, **kwargs)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ANIMEFIRE — Primary Source
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Slug Cache ──────────────────────────────────────────────────
+_SLUG_CACHE = {}
+_SLUG_CACHE_PATH = os.path.expanduser("~/.local/share/anime-dl-br/slug_cache.json")
+
+def _load_slug_cache():
+    global _SLUG_CACHE
+    if _SLUG_CACHE:
+        return
+    try:
+        if os.path.exists(_SLUG_CACHE_PATH):
+            with open(_SLUG_CACHE_PATH) as f:
+                _SLUG_CACHE = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        _SLUG_CACHE = {}
+
+def _save_slug_cache():
+    try:
+        os.makedirs(os.path.dirname(_SLUG_CACHE_PATH), exist_ok=True)
+        with open(_SLUG_CACHE_PATH, "w") as f:
+            json.dump(_SLUG_CACHE, f)
+    except OSError:
+        pass
+
+
+def search_animefire(query):
+    """Search anime on AnimeFire.
+
+    AnimeFire's native search (?s=) is broken server-side — it ignores the
+    query and always returns the same generic listing. This function tries
+    it anyway, checks if results are relevant, and falls back to
+    AnimesOnlineCC search if they aren't.
+
+    Returns list of {slug, title, url, source}.
+    """
+    session = get_session()
+    search_url = f"{ANIMEFIRE_BASE}/?s={quote(query)}"
+    try:
+        r = http_get(session, search_url)
+    except Exception:
+        return _search_animefire_fallback(query, session)
+
+    if r.status_code != 200:
+        return _search_animefire_fallback(query, session)
+
+    html = r.text
+    results = []
+    seen = set()
+    q_words = set(query.lower().split())
+
+    # Collect ALL anime page slugs (skip episode pages /slug/N)
+    for m in re.finditer(
+        r'title=["\']([^"\']+)["\'][^>]*>.*?href=["\'](?:https://animefire\.io)?/animes/([^"\'/]+)["\']',
+        html, re.IGNORECASE
+    ):
+        title = clean_title(m.group(1).strip())
+        slug = m.group(2).rstrip('/')
+        if slug in seen or not title or slug.endswith(('.webp', 'jpg', 'png')):
+            continue
+        seen.add(slug)
+        results.append({
+            "slug": slug,
+            "title": title,
+            "url": f"{ANIMEFIRE_BASE}/animes/{slug}",
+            "source": "animefire",
+        })
+
+    # Also catch cards without title= attribute
+    if not results:
+        for m in re.finditer(
+            r'<a\s+href=["\'](?:https://animefire\.io)?/animes/([^"\'/]+)["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
+            html, re.DOTALL | re.IGNORECASE
+        ):
+            slug = m.group(1).rstrip('/')
+            title = clean_title(m.group(2).strip())
+            if slug not in seen and title and not slug.endswith('.webp'):
+                seen.add(slug)
+                snippet = html[m.start():m.end()]
+                h3_m = re.search(r'<h3[^>]*class=["\']animeTitle["\'][^>]*>([^<]+)</h3>', snippet)
+                if h3_m:
+                    title = clean_title(h3_m.group(1).strip())
+                results.append({
+                    "slug": slug,
+                    "title": title,
+                    "url": f"{ANIMEFIRE_BASE}/animes/{slug}",
+                    "source": "animefire",
+                })
+
+    # Check relevance — if none of the result titles contain the query words,
+    # the search endpoint is returning garbage. Fall back.
+    relevant = any(
+        any(w in r["title"].lower() for w in q_words)
+        for r in results
+    ) if q_words else True
+
+    if results and relevant:
+        return results
+
+    return _search_animefire_fallback(query, session)
+
+
+def _search_animefire_fallback(query, session):
+    """Fallback: search AnimesOnlineCC and try to resolve to AnimeFire slugs."""
+    results = search_animesonline(query)
+    for r in results:
+        r["source"] = "animesonline"
+        # Try to resolve to AnimeFire slug (cached)
+        af_slug = _resolve_animefire_slug_cached(r["slug"])
+        if af_slug:
+            r["animefire_slug"] = af_slug
+            r["animefire_url"] = f"{ANIMEFIRE_BASE}/animes/{af_slug}"
+    return results
+
+
+def _resolve_animefire_slug_cached(aonline_slug):
+    """Resolve an AnimesOnlineCC slug to an AnimeFire slug with caching.
+
+    AnimesOnlineCC slugs (e.g. 'jujutsu-kaisen-hd') differ from AnimeFire
+    slugs (e.g. 'jujutsu-kaisen-tv-todos-os-episodios'). This function
+    probes common AnimeFire URL patterns and caches the result so subsequent
+    lookups are instant.
+    """
+    _load_slug_cache()
+
+    base = re.sub(r'-(hd|dublado|legendado)$', '', aonline_slug)
+
+    # Check cache
+    if base in _SLUG_CACHE:
+        return _SLUG_CACHE[base]
+
+    session = get_session()
+    patterns = [
+        f"{base}-tv-todos-os-episodios",
+        f"{base}-hd-todos-os-episodios",
+        f"{base}-legendado-todos-os-episodios",
+        f"{base}-tv",
+        f"{base}-hd",
+        f"{base}-todos-os-episodios",
+        f"{base}-dublado-todos-os-episodios",
+        f"{base}",
+    ]
+
+    # Try patterns in order, stop at first 200
+    for pat in patterns:
+        for url in [f"{ANIMEFIRE_BASE}/animes/{pat}",
+                    f"{ANIMEFIRE_BASE}/animes/{pat}/"]:
+            try:
+                r = http_get(session, url, timeout=8)
+                if r.status_code == 200:
+                    _SLUG_CACHE[base] = pat
+                    _save_slug_cache()
+                    return pat
+            except Exception:
+                continue
+
+    # Not found — cache None to avoid re-checking
+    _SLUG_CACHE[base] = None
+    _save_slug_cache()
+    return None
+
+
+def get_animefire_base_slug(slug):
+    """Derive base slug for episode URLs from search-result slug.
+
+    AnimeFire search returns slugs like 'jujutsu-kaisen-tv-todos-os-episodios'
+    but episode links use 'jujutsu-kaisen-tv/{ep_num}'.
+    """
+    base = slug
+    for suffix in ['-todos-os-episodios', '-dublado-todos-os-episodios',
+                   '-hd-todos-os-episodios', '-legendado-todos-os-episodios']:
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    return base
+
+
+def get_animefire_episodes(slug):
+    """Get all episodes for an anime from AnimeFire.
+
+    Returns dict with {title, episodes: [{num, url}], total_count}.
+    """
+    session = get_session()
+    base_slug = get_animefire_base_slug(slug)
+
+    # Try variants of the anime page URL
+    urls_to_try = [
+        f"{ANIMEFIRE_BASE}/animes/{slug}",
+        f"{ANIMEFIRE_BASE}/animes/{base_slug}",
+        f"{ANIMEFIRE_BASE}/animes/{slug}/",
+        f"{ANIMEFIRE_BASE}/animes/{base_slug}/",
+    ]
+
+    html = None
+    title = None
+    used_base = base_slug
+
+    for url in urls_to_try:
+        try:
+            r = http_get(session, url)
+            if r.status_code == 200:
+                html = r.text
+                # Extract title — clean aggressively
+                h1 = re.search(r'<h1[^>]*>([^<]+)</h1>', html)
+                if h1:
+                    title = h1.group(1).strip()
+                    # Some pages return "Title - Episódio N" (episode page).
+                    # Strip the episode suffix for clean anime title.
+                    title = re.sub(
+                        r'\s*[-–—|]\s*Epis[óo]dio\s+\d+.*$', '', title
+                    ).strip()
+                    title = re.sub(
+                        r'\s*[-–—|]\s*Epis[óo]dio\s+[Úú]nico.*$', '', title
+                    ).strip()
+                if not title:
+                    og = re.search(
+                        r'<meta\s+property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
+                        html
+                    )
+                    if og:
+                        title = og.group(1).strip()
+                        title = re.sub(
+                            r'\s*[-–—|]\s*Epis[óo]dio\s+\d+.*$', '', title
+                        ).strip()
+                # Extract the actual base slug from episode links if different
+                all_ep_slugs = set(re.findall(r'/animes/([^/]+)/\d+', html))
+                if all_ep_slugs:
+                    # Use the most common one
+                    from collections import Counter
+                    used_base = Counter(list(all_ep_slugs)).most_common(1)[0][0]
+                break
+        except Exception:
+            continue
+
+    if not html:
+        return {"title": slug.replace('-', ' ').title(), "episodes": [], "total_count": 0}
+
+    # Find episode links
+    eps = []
+    seen_nums = set()
+    ep_pattern = rf'/animes/{re.escape(used_base)}/(\d+)'
+    for m in re.finditer(ep_pattern, html):
+        num = int(m.group(1))
+        if num not in seen_nums:
+            seen_nums.add(num)
+            eps.append({
+                "num": num,
+                "url": f"{ANIMEFIRE_BASE}/animes/{used_base}/{num}",
+            })
+
+    eps.sort(key=lambda x: x["num"])
+    return {
+        "title": clean_title(title) if title else slug.replace('-', ' ').title(),
+        "episodes": eps,
+        "total_count": len(eps),
+    }
+
+
+def get_animefire_video_urls(base_slug, episode):
+    """Get direct mp4 video URLs from AnimeFire's JSON video API.
+
+    Returns list of {url, quality} sorted by quality descending.
+    If the JSON API returns no videos but a Blogger embed exists,
+    appends a marker {'blogger_url': '...'} for fallback handling.
+    """
+    session = get_session()
+    ts = int(time.time())
+
+    # Fetch episode page to find the video API endpoint
+    ep_url = f"{ANIMEFIRE_BASE}/animes/{base_slug}/{episode}"
+    try:
+        r = http_get(session, ep_url)
+    except Exception:
+        return []
+    if r.status_code != 200:
+        return []
+
+    html = r.text
+    video_api_url = None
+
+    # src="/video/{slug}/{ep}?tempsubs=0&..."
+    for pat in [
+        r'src=["\'](https://animefire\.io/video/[^"\']+)["\']',
+        r'src=["\'](/video/[^"\']+)["\']',
+        r'(?:href|data-src)=["\'](https://animefire\.io/video/[^"\']+)["\']',
+    ]:
+        m = re.search(pat, html)
+        if m:
+            raw = m.group(1)
+            video_api_url = raw if raw.startswith('http') else f"{ANIMEFIRE_BASE}{raw}"
+            break
+
+    # Construct directly if not found
+    if not video_api_url:
+        video_api_url = f"{ANIMEFIRE_BASE}/video/{base_slug}/{episode}?tempsubs=0&{ts}"
+
+    # Fetch the JSON video API
+    try:
+        r2 = http_get(session, video_api_url)
+    except Exception:
+        return []
+    if r2.status_code != 200:
+        return []
+
+    try:
+        data = r2.json()
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    videos = []
+    for item in data.get("data", []):
+        src = item.get("src", "")
+        label = item.get("label", "unknown")
+        if src and src.startswith("http"):
+            videos.append({"url": src, "quality": label})
+
+    # Sort: 1080p > 720p > 480p > 360p > unknown
+    quality_order = {"1080p": 3, "720p": 2, "480p": 1, "360p": 0}
+    videos.sort(key=lambda v: quality_order.get(v["quality"], -1), reverse=True)
+
+    # If API returned empty but page has a Blogger embed, mark for fallback
+    if not videos:
+        blogger_urls = re.findall(
+            r'src=["\'](https://www\.blogger\.com/video\.g\?token=[^"\']+)["\']', html
+        )
+        if blogger_urls:
+            videos.append({"blogger_url": blogger_urls[0]})
+
+    return videos
+
+
+# ── Playwright Blogger Extraction ─────────────────────────────────
+def get_blogger_video_url_playwright(episode_url, timeout=30):
+    """Extract direct video URL from an AnimesOnlineCC episode page using Playwright.
+
+    AnimesOnlineCC episodes use Blogger's iframe player which loads video via
+    Google's internal batch-execute RPC API. The video URL only appears when
+    the full episode page loads the Blogger iframe with the correct referrer
+    context — navigating to the Blogger URL directly gives an auth wall.
+
+    This function navigates to the episode page, intercepts the batch-execute
+    RPC response, and extracts the googlevideo URL.
+
+    Returns (video_url, quality_label) tuple or (None, None).
+    """
+    if not HAS_PLAYWRIGHT:
+        return None, None
+
+    import urllib.parse
+    import json
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                locale="pt-BR",
+                viewport={"width": 1280, "height": 720},
+            )
+            page = context.new_page()
+            captured_url = None
+            captured_quality = None
+
+            def _on_response(response):
+                nonlocal captured_url, captured_quality
+                if captured_url:
+                    return
+
+                url = response.url
+
+                # Intercept Blogger's batch execute RPC
+                if "batchexecute" in url:
+                    try:
+                        body = response.body()
+                        text = body.decode("utf-8", errors="replace")
+                        # The response format is: )]}'\n\nNUMBER\n[["wrb.fr","WcwnYd","[...video URLs...]",...]
+                        # URLs are googlevideo CDN URLs with subdomain, e.g.:
+                        #   https://rr1---sn-8p8v-bg067.googlevideo.com/videoplayback?...
+                        m = re.search(r'https?://[^"\s]*googlevideo\.com[^"\s]+', text)
+                        if m:
+                            raw = m.group(0)
+                            # Unescape \\u003d → = and \\u0026 → &
+                            raw = raw.replace("\\\\u003d", "=").replace("\\\\u0026", "&")
+                            raw = raw.replace("\\u003d", "=").replace("\\u0026", "&")
+                            full_url = raw
+                            # Prefer itag=22 (720p) over itag=18 (360p)
+                            if "itag=22" in full_url:
+                                captured_url = full_url
+                                captured_quality = "720p"
+                            elif "itag=18" in full_url and not captured_url:
+                                captured_url = full_url
+                                captured_quality = "360p"
+                    except Exception:
+                        pass
+
+                # Fallback: direct video response capture
+                ct = response.headers.get("content-type", "")
+                if ct.startswith("video/"):
+                    captured_url = response.url
+                    captured_quality = "unknown"
+
+            page.on("response", _on_response)
+
+            try:
+                page.goto(episode_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                # Wait for Blogger JS to load and execute batch RPC
+                page.wait_for_timeout(10000)
+            except Exception:
+                pass
+            finally:
+                browser.close()
+
+            if captured_url:
+                return captured_url, captured_quality
+
+            return None, None
+    except Exception:
+        return None, None
+
+
+# ── Shared Download Helper ────────────────────────────────────────
+def _download_video(video_url, out_path, out_dir, plex_name, embed_subs=False, referer=None):
+    """Download a video URL using yt-dlp (preferred) or requests (fallback).
+
+    Returns path to downloaded file or None.
+    """
+    # Method 1: yt-dlp (handles resume, progress, retries)
+    if YT_DLP_BIN and shutil.which(YT_DLP_BIN):
+        ytdl_cmd = [YT_DLP_BIN, "--no-warnings", "--output", out_path,
+                    "--referer", referer or "",
+                    "--user-agent", USER_AGENT]
+        if 'googlevideo' in video_url.lower():
+            ytdl_cmd += ["--no-check-certificate"]
+        if embed_subs:
+            ytdl_cmd += ["--embed-subs", "--embed-metadata"]
+            ytdl_cmd += ["--sub-langs", "all"]
+        ytdl_cmd += [video_url]
+        try:
+            result = subprocess.run(
+                ytdl_cmd,
+                capture_output=True, text=True, timeout=600
+            )
+            if result.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                size_mb = os.path.getsize(out_path) / (1024 * 1024)
+                print(f"  ✅ Complete: {size_mb:.1f} MB")
+                return out_path
+
+            # yt-dlp may append suffixes — check for partial files
+            try:
+                for f in os.listdir(out_dir):
+                    fpath = os.path.join(out_dir, f)
+                    base_no_ext = os.path.splitext(plex_name)[0]
+                    if f.startswith(base_no_ext) and f.endswith(('.mp4', '.mkv', '.webm')):
+                        if f != plex_name:
+                            os.rename(fpath, out_path)
+                        return out_path
+            except OSError:
+                pass
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"  ⚠️  yt-dlp: {e}")
+
+    # Method 2: Direct download with requests
+    print(f"  📥 Downloading (requests)...")
+    sess = get_session()
+    try:
+        kwargs = {"stream": True, "timeout": 120}
+        if 'googlevideo' in video_url.lower():
+            kwargs["verify"] = False
+        kwargs["headers"] = {"Referer": referer} if referer else {}
+        video_r = http_get(sess, video_url, **kwargs)
+        video_r.raise_for_status()
+
+        total = int(video_r.headers.get('content-length', 0))
+        downloaded = 0
+
+        with open(out_path, 'wb') as f:
+            for chunk in video_r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = downloaded / total * 100
+                        bar_len = 30
+                        filled = int(bar_len * downloaded / total)
+                        bar = '█' * filled + '░' * (bar_len - filled)
+                        sys.stdout.write(f"\r    [{bar}] {pct:.0f}%")
+                        sys.stdout.flush()
+        print()
+
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+            size_mb = os.path.getsize(out_path) / (1024 * 1024)
+            print(f"  ✅ Complete: {size_mb:.1f} MB")
+            return out_path
+    except Exception as e:
+        print(f"  ❌ Download failed: {e}")
+        if os.path.isfile(out_path):
+            os.remove(out_path)
+
+    return None
+
+
+def download_via_goanime(anime_title, episode, quality="best", output_dir=None):
+    """Attempt download using goanime binary. Returns file path or None."""
+    if not os.path.isfile(GOANIME_BIN):
+        return None
+
+    try:
+        cmd = [GOANIME_BIN, "-d", "--source", "animefire", "--quality", quality]
+        if output_dir:
+            cmd += ["-o", output_dir]
+        cmd += [anime_title, str(episode)]
+
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300
+        )
+
+        # Check success
+        if result.returncode == 0 and "ERRO" not in result.stderr:
+            out_dir = output_dir or DEFAULT_DOWNLOAD_DIR
+            # Find most recent file in output dir
+            if os.path.isdir(out_dir):
+                files = [os.path.join(out_dir, f) for f in os.listdir(out_dir)
+                        if f.endswith(('.mp4', '.mkv'))]
+                if files:
+                    newest = max(files, key=os.path.getmtime)
+                    if time.time() - os.path.getmtime(newest) < 60:
+                        return newest
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    return None
+
+
+def download_animefire(anime_title, slug, episode, quality="best", output_dir=None, embed_subs=False):
+    """Download a single episode from AnimeFire.
+
+    Tries goanime first, falls back to AnimeFire's JSON video API.
+    Returns path to downloaded file or None.
+    """
+    base_slug = get_animefire_base_slug(slug)
+    out_dir = output_dir or DEFAULT_DOWNLOAD_DIR
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Plex-compatible filename
+    plex_name = f"{anime_title} - S01E{episode:02d}.mp4"
+    out_path = os.path.join(out_dir, plex_name)
+
+    if os.path.isfile(out_path):
+        print(f"  ⏭️  Already exists: {out_path}")
+        return out_path
+
+    # Method 1: Try goanime binary
+    goanime_path = download_via_goanime(anime_title, episode, quality, output_dir)
+    if goanime_path and os.path.isfile(goanime_path):
+        goanime_base = os.path.basename(goanime_path)
+        if goanime_base != plex_name:
+            # Rename to Plex format
+            if os.path.isfile(out_path):
+                os.remove(out_path)
+            try:
+                os.rename(goanime_path, out_path)
+            except OSError:
+                shutil.copy2(goanime_path, out_path)
+                os.remove(goanime_path)
+        return out_path
+
+    # Method 2: Direct AnimeFire JSON API download
+    print(f"  🅰️  Fetching video URLs from AnimeFire...")
+    videos = get_animefire_video_urls(base_slug, episode)
+
+    if not videos:
+        print(f"  ❌ No video URLs found for episode {episode}")
+        return None
+
+    # Check if the result is a Blogger fallback marker
+    if "blogger_url" in videos[0]:
+        b_url = videos[0]["blogger_url"]
+        print(f"  ℹ️  This episode is hosted on Blogger (JS player).")
+
+        # Method A: Try Playwright extraction (browser-based)
+        if HAS_PLAYWRIGHT:
+            print(f"  🎭 Attempting Playwright extraction...")
+            animefire_ep_url = f"{ANIMEFIRE_BASE}/animes/{base_slug}/{episode}"
+            pw_url, pw_q = get_blogger_video_url_playwright(animefire_ep_url)
+            if pw_url:
+                print(f"  ✅ Playwright extracted video URL ({pw_q or 'unknown'})")
+                return _download_video(pw_url, out_path, out_dir, plex_name, embed_subs, f"{ANIMEFIRE_BASE}/")
+
+        # Method B: Try AnimesOnlineCC as fallback
+        print(f"  🔄 Trying AnimesOnlineCC as fallback...")
+        aonline_path = download_animesonline(anime_title, slug, episode, quality, output_dir)
+        if aonline_path:
+            return aonline_path
+        print(f"  ❌ Could not extract video from Blogger or AnimesOnlineCC.")
+        print(f"  💡 Try: anime-dl-br episodes {slug} --source animesonline")
+        return None
+
+    # Select quality
+    quality_map = {"1080p": 3, "720p": 2, "480p": 1, "360p": 0, "best": 2}
+    target = quality_map.get(quality, 2)
+
+    selected = None
+    for v in videos:
+        vq = quality_map.get(v["quality"], -1)
+        if vq <= target:
+            selected = v
+            break
+    if not selected:
+        selected = videos[0]
+
+    video_url = selected["url"]
+    print(f"  📥 Downloading {selected['quality']}: {video_url[:80]}...")
+    return _download_video(video_url, out_path, out_dir, plex_name, embed_subs, f"{ANIMEFIRE_BASE}/")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ANIMESONLINECC.TO — Fallback Source
+# ═══════════════════════════════════════════════════════════════════
+
+def search_animesonline(query):
+    """Search anime on AnimesOnlineCC. Returns list of {slug, title, url}."""
+    session = get_session()
+    search_url = f"{ANIMESONLINE_BASE}/?s={quote(query)}"
+    try:
+        r = http_get(session, search_url)
+    except Exception:
+        return []
+    if r.status_code != 200:
+        return []
+
+    html = r.text
+    results = []
+    seen = set()
+
+    # <a href="https://animesonlinecc.to/anime/{slug}/">
+    for m in re.finditer(
+        r'<a\s+href=["\']https://animesonlinecc\.to/anime/([^"\']+)/?["\'][^>]*>(.*?)</a>',
+        html, re.DOTALL | re.IGNORECASE
+    ):
+        slug = m.group(1).rstrip('/')
+        inner = m.group(2)
+        # Extract title from img alt or text
+        alt_m = re.search(r'alt=["\']([^"\']+)["\']', inner)
+        title = alt_m.group(1).strip() if alt_m else ''
+        if not title:
+            title = re.sub(r'<[^>]+>', '', inner).strip()
+            if slug not in seen and title.strip() and slug:
+                seen.add(slug)
+                results.append({
+                    "slug": slug,
+                    "title": clean_title(title.strip()),
+                    "url": f"{ANIMESONLINE_BASE}/anime/{slug}/",
+                })
+
+    return results
+
+
+def get_animesonline_episodes(slug):
+    """Get all episodes for an anime on AnimesOnlineCC.
+
+    Returns dict with {title, episodes: [{num, url}], total_count}.
+    """
+    session = get_session()
+    url = f"{ANIMESONLINE_BASE}/anime/{slug}/"
+    try:
+        r = http_get(session, url)
+    except Exception:
+        return {"title": slug.replace('-', ' ').title(), "episodes": [], "total_count": 0}
+    if r.status_code != 200:
+        return {"title": slug.replace('-', ' ').title(), "episodes": [], "total_count": 0}
+
+    html = r.text
+
+    # Extract title
+    title = None
+    h1 = re.search(r'<h1[^>]*>([^<]+)</h1>', html)
+    if h1:
+        title = h1.group(1).strip()
+    if not title:
+        og = re.search(
+            r'<meta\s+property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']', html
+        )
+        if og:
+            title = og.group(1).strip()
+    if not title:
+        title = slug.replace('-', ' ').title()
+
+    # Find episode links
+    eps = []
+    seen_nums = set()
+    for m in re.finditer(
+        r'href=["\'](https://animesonlinecc\.to/episodio/[^"\']*?-(\d+)/?)["\']',
+        html, re.IGNORECASE
+    ):
+        href = m.group(1)
+        num = int(m.group(2))
+        if num not in seen_nums:
+            seen_nums.add(num)
+            eps.append({"num": num, "url": href})
+
+    eps.sort(key=lambda x: x["num"])
+    return {"title": clean_title(title) if title else slug.replace('-', ' ').title(),
+            "episodes": eps, "total_count": len(eps)}
+
+
+def get_animesonline_video_url(slug, episode):
+    """Extract direct video URL from an AnimesOnlineCC episode page.
+
+    Returns video URL string or None.
+    """
+    base_name = re.sub(r'-hd$', '', slug)
+    ep_url = f"{ANIMESONLINE_BASE}/episodio/{base_name}-episodio-{episode}/"
+
+    # Method 1: yt-dlp on the full episode page
+    if YT_DLP_BIN and shutil.which(YT_DLP_BIN):
+        try:
+            result = subprocess.run(
+                [YT_DLP_BIN, "--no-warnings", "--referer", ANIMESONLINE_BASE,
+                 "--get-url", "--extractor-args", "generic:no-playlist",
+                 ep_url],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                urls = [l.strip() for l in result.stdout.split('\n')
+                       if l.strip().startswith('http')]
+                if urls:
+                    return urls[0]
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # Method 2: Fetch page, find Blogger iframe, try yt-dlp on it
+    session = get_session()
+    try:
+        r = http_get(session, ep_url)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+
+    html = r.text
+
+    # Try each Blogger iframe URL
+    blogger_urls = re.findall(
+        r'src=["\'](https://www\.blogger\.com/video\.g\?token=[^"\']+)["\']', html
+    )
+
+    for b_url in blogger_urls[:2]:
+        # yt-dlp on Blogger URL
+        if YT_DLP_BIN and shutil.which(YT_DLP_BIN):
+            try:
+                result = subprocess.run(
+                    [YT_DLP_BIN, "--no-warnings", "--referer", ep_url,
+                     "--get-url", b_url],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    urls = [l.strip() for l in result.stdout.split('\n')
+                           if l.strip().startswith('http')]
+                    if urls:
+                        return urls[0]
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        # Direct approach: HEAD/GET with redirects
+        for method in ['head', 'get']:
+            try:
+                fn = requests.head if method == 'head' else session.get
+                r2 = fn(b_url, impersonate='chrome120', timeout=15,
+                        allow_redirects=True, headers={'Referer': ep_url})
+                final = r2.url
+                if final != b_url and ('googlevideo' in final or
+                                       '.mp4' in final or
+                                       'googleusercontent' in final):
+                    return final
+            except Exception:
+                pass
+
+    # Method 3: Playwright headless browser extraction
+    if HAS_PLAYWRIGHT:
+        pw_url, pw_q = get_blogger_video_url_playwright(ep_url)
+        if pw_url:
+            return pw_url
+
+    return None
+
+
+def download_animesonline(anime_title, slug, episode, quality="best", output_dir=None, embed_subs=False):
+    """Download a single episode from AnimesOnlineCC (fallback).
+
+    Returns path to downloaded file or None.
+    """
+    out_dir = output_dir or DEFAULT_DOWNLOAD_DIR
+    os.makedirs(out_dir, exist_ok=True)
+
+    plex_name = f"{anime_title} - S01E{episode:02d}.mp4"
+    out_path = os.path.join(out_dir, plex_name)
+
+    if os.path.isfile(out_path):
+        print(f"  ⏭️  Already exists: {out_path}")
+        return out_path
+
+    print(f"  🔍 Extracting video from AnimesOnlineCC...")
+    video_url = get_animesonline_video_url(slug, episode)
+
+    if not video_url:
+        print(f"  ❌ Could not extract video URL from AnimesOnlineCC.")
+        print(f"  💡 AnimesOnlineCC uses Blogger's JS-based player which requires a browser.")
+        print(f"  💡 Use --source animefire instead (AnimeFire has a working direct API).")
+        print(f"  💡 Example: anime-dl-br download \"{slug}\" {episode} --source animefire")
+        return None
+
+    print(f"  📥 Downloading...")
+
+    if YT_DLP_BIN and shutil.which(YT_DLP_BIN):
+        ytdl_cmd = [YT_DLP_BIN, "--no-warnings", "--output", out_path,
+                    "--referer", ANIMESONLINE_BASE,
+                    "--user-agent", USER_AGENT]
+        if 'googlevideo' in video_url.lower():
+            ytdl_cmd += ["--no-check-certificate"]
+        if embed_subs:
+            ytdl_cmd += ["--embed-subs", "--embed-metadata"]
+            ytdl_cmd += ["--sub-langs", "all"]
+        ytdl_cmd += [video_url]
+        try:
+            result = subprocess.run(
+                ytdl_cmd,
+                capture_output=True, text=True, timeout=600
+            )
+            if result.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                size_mb = os.path.getsize(out_path) / (1024 * 1024)
+                print(f"  ✅ Complete: {size_mb:.1f} MB")
+                return out_path
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"  ⚠️  yt-dlp: {e}")
+
+    # Fallback: requests
+    sess = get_session()
+    try:
+        kwargs = {"stream": True, "timeout": 120}
+        if 'googlevideo' in video_url.lower():
+            kwargs["verify"] = False
+        # Set Referer to the episode page (googlevideo CDN requires it)
+        base_name = re.sub(r'-hd$', '', slug)
+        ep_ref = f"{ANIMESONLINE_BASE}/episodio/{base_name}-episodio-{episode}/"
+        kwargs["headers"] = {"Referer": ep_ref}
+        video_r = http_get(sess, video_url, **kwargs)
+        video_r.raise_for_status()
+        total = int(video_r.headers.get('content-length', 0))
+        downloaded = 0
+        with open(out_path, 'wb') as f:
+            for chunk in video_r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = downloaded / total * 100
+                        bar_len = 30
+                        filled = int(bar_len * downloaded / total)
+                        bar = '█' * filled + '░' * (bar_len - filled)
+                        sys.stdout.write(f"\r    [{bar}] {pct:.0f}%")
+                        sys.stdout.flush()
+        print()
+        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+            size_mb = os.path.getsize(out_path) / (1024 * 1024)
+            print(f"  ✅ Complete: {size_mb:.1f} MB")
+            return out_path
+    except Exception as e:
+        print(f"  ❌ Download failed: {e}")
+        if os.path.isfile(out_path):
+            os.remove(out_path)
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PROGRESS TRACKING DB (GoAnime compatible)
+# ═══════════════════════════════════════════════════════════════════
+
+def get_media_duration(filepath):
+    """Get duration in seconds from media file via ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", filepath],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            duration = float(info.get("format", {}).get("duration", 0))
+            return max(1, int(duration))
+    except Exception:
+        pass
+    return 1
+
+
+def update_progress_db(anime_title, episode, filepath, mark_watched=False):
+    """Update GoAnime's progress.db.
+
+    Uses the production schema:
+      allanime_id TEXT PRIMARY KEY,
+      episode_number INTEGER, playback_time INTEGER DEFAULT 0,
+      duration INTEGER, title TEXT, media_type TEXT DEFAULT 'anime',
+      last_updated INTEGER
+
+    Args:
+        mark_watched: If True, sets playback_time = duration (episode fully watched).
+                      If False, inserts new entry with playback_time=0 (just downloaded).
+    """
+    if not os.path.exists(GOANIME_DB):
+        if mark_watched:
+            print(f"  ℹ️  GoAnime DB not found: {GOANIME_DB}")
+        return
+
+    try:
+        conn = sqlite3.connect(GOANIME_DB)
+        cur = conn.cursor()
+
+        allanime_id = f"{anime_title}-ep{episode}"
+        now = int(time.time())
+
+        if mark_watched:
+            # Mark as fully watched: playback_time = duration
+            cur.execute("""
+                UPDATE media_progress
+                SET playback_time = duration, last_updated = ?
+                WHERE allanime_id = ?
+            """, (now, allanime_id))
+            if cur.rowcount > 0:
+                conn.commit()
+                print(f"  📝 Marked as watched ✓")
+            else:
+                # Entry doesn't exist yet — insert with watched status
+                duration = get_media_duration(filepath)
+                cur.execute(
+                    """INSERT OR REPLACE INTO media_progress
+                       (allanime_id, episode_number, playback_time, duration,
+                        title, media_type, last_updated)
+                       VALUES (?, ?, ?, ?, ?, 'anime', ?)""",
+                    (allanime_id, episode, duration, duration, anime_title, now)
+                )
+                conn.commit()
+                print(f"  📝 Added to tracking DB (watched, {duration}s)")
+        else:
+            # Download tracking: insert if not exists
+            duration = get_media_duration(filepath)
+            cur.execute(
+                """INSERT OR IGNORE INTO media_progress
+                   (allanime_id, episode_number, playback_time, duration,
+                    title, media_type, last_updated)
+                   VALUES (?, ?, 0, ?, ?, 'anime', ?)""",
+                (allanime_id, episode, duration, anime_title, now)
+            )
+            if cur.rowcount > 0:
+                conn.commit()
+                print(f"  📝 Added to tracking DB ({duration}s)")
+
+        conn.close()
+    except Exception as e:
+        print(f"  ⚠️  Could not update DB: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  RESOLVE ANIME SLUG + TITLE
+# ═══════════════════════════════════════════════════════════════════
+
+def resolve_animefire_slug(query):
+    """Try to find a valid AnimeFire slug by testing common patterns.
+
+    AnimeFire's search endpoint is broken, so we probe known URL patterns.
+    Returns (slug, title) or (None, None).
+    """
+    base = query.lower().strip()
+    # Normalize: remove parens, collapse spaces, replace spaces with hyphens
+    base = re.sub(r'[()]', '', base)
+    base = re.sub(r'\s+', '-', base.strip())
+    base = re.sub(r'-+', '-', base)
+
+    session = get_session()
+    # Order by preference: non-dubbed > subbed > dubbed
+    # -tv and -hd are usually the original Japanese with subs
+    patterns = [
+        f"{base}-tv-todos-os-episodios",    # Best: original with subs, full listing
+        f"{base}-hd-todos-os-episodios",
+        f"{base}-legendado-todos-os-episodios",  # Explicitly subbed
+        f"{base}-tv",
+        f"{base}-hd",
+        f"{base}-todos-os-episodios",        # Generic full listing
+        f"{base}-dublado-todos-os-episodios",  # Dubbed (Portuguese) — lowest priority
+        f"{base}-dublado",
+        f"{base}",                            # Base slug last
+    ]
+
+    to_test = []
+    seen = set()
+    for p in patterns:
+        if p not in seen:
+            seen.add(p)
+            to_test.append(p)
+
+    for slug_candidate in to_test:
+        # Try without trailing slash first (AnimeFire returns 404 with /)
+        for url in [f"{ANIMEFIRE_BASE}/animes/{slug_candidate}",
+                    f"{ANIMEFIRE_BASE}/animes/{slug_candidate}/"]:
+            try:
+                r = http_get(session, url, timeout=10)
+                if r.status_code == 200:
+                    h1 = re.search(r'<h1[^>]*>([^<]+)</h1>', r.text)
+                    title = h1.group(1).strip() if h1 else slug_candidate.replace('-', ' ').title()
+                    # Clean up episode-page H1 (e.g. "Jujutsu Kaisen (TV) - Episódio 1")
+                    title = re.sub(r'\s*[-–—]\s*Epis[óo]dio\s+\d+.*$', '', title).strip()
+                    title = re.sub(r'\s*[-–—]\s*Epis[óo]dio\s+[Úú]nico.*$', '', title).strip()
+                    if not title:
+                        title = slug_candidate.replace('-', ' ').title()
+                    return slug_candidate, title
+            except Exception:
+                continue
+
+    return None, None
+
+
+def resolve_anime(source, query):
+    """Search for an anime and return (slug, title) of best match."""
+    if source == "animefire":
+        results = search_animefire(query)
+        if not results:
+            # Search endpoint broken — try common URL patterns
+            return resolve_animefire_slug(query)
+    else:
+        results = search_animesonline(query)
+
+    if not results:
+        return None, None
+
+    # Exact match first
+    q = query.lower()
+    for r in results:
+        if r["title"].lower() == q or r["slug"].lower() == q:
+            return r["slug"], r["title"]
+
+    # First result
+    return results[0]["slug"], results[0]["title"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  WATCH — Play downloaded episode
+# ═══════════════════════════════════════════════════════════════════
+
+MPV_BIN = shutil.which("mpv") or "/usr/bin/mpv"
+
+
+def cmd_watch(title, episode=None, player=None, download_dir=None):
+    """Find and play a downloaded episode.
+
+    If episode is None, list available downloads and let user pick.
+    Returns True if played successfully.
+    """
+    ddir = download_dir or DEFAULT_DOWNLOAD_DIR
+    if not os.path.isdir(ddir):
+        print(f"📁 Download directory not found: {ddir}")
+        print(f"   Download an episode first: anime-dl-br download \"{title}\" 1")
+        return False
+
+    files = sorted(os.listdir(ddir))
+    title_norm = title.lower().replace(' ', '-').replace(':', '').replace('(', '').replace(')', '')
+
+    if episode is not None:
+        ep_str = f"{episode:02d}"
+        # Match by normalized filename containing title + episode number
+        matched = []
+        for f in files:
+            if not f.endswith(('.mp4', '.mkv')):
+                continue
+            fnorm = f.lower().replace(' ', '-').replace(':', '').replace('(', '').replace(')', '')
+            if title_norm in fnorm:
+                # Check for episode match: S01E01, -01, _01, etc.
+                if re.search(rf'(?:S\d+E)?0*{episode}(?:\.mp4|\.mkv|\b)', fnorm):
+                    matched.append(f)
+
+        if not matched:
+            print(f"❌ Episode {episode} of '{title}' not found.")
+            print(f"   Directory: {ddir}")
+            print(f"   Download it first: anime-dl-br download \"{title}\" {episode}")
+            return False
+
+        filepath = os.path.join(ddir, matched[0])
+    else:
+        # List all files matching the title
+        title_norm = title.lower().replace(' ', '-').replace(':', '')
+        candidates = [f for f in files
+                      if f.endswith(('.mp4', '.mkv')) and title_norm in f.lower()]
+        if not candidates:
+            print(f"❌ No downloaded episodes found for '{title}'.")
+            print(f"   Directory: {ddir}")
+            print(f"   Available downloads:")
+            for f in files[:10]:
+                if f.endswith(('.mp4', '.mkv')):
+                    print(f"     {f}")
+            return False
+
+        if len(candidates) == 1:
+            filepath = os.path.join(ddir, candidates[0])
+        else:
+            # Show list and let user pick
+            print(f"\n📺 Downloaded episodes of '{title}':\n")
+            for i, f in enumerate(candidates, 1):
+                size_mb = os.path.getsize(os.path.join(ddir, f)) / (1024 * 1024)
+                print(f"  {i}. {f} ({size_mb:.0f} MB)")
+            print()
+            try:
+                choice = input(f"  Choose episode (1-{len(candidates)}, Enter=1): ").strip()
+                idx = int(choice) - 1 if choice else 0
+                if idx < 0 or idx >= len(candidates):
+                    print("Invalid choice.")
+                    return False
+            except (ValueError, EOFError):
+                idx = 0
+            filepath = os.path.join(ddir, candidates[idx])
+
+    if not os.path.isfile(filepath):
+        print(f"❌ File not found: {filepath}")
+        return False
+
+    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+    print(f"\n▶️  Playing: {os.path.basename(filepath)} ({size_mb:.0f} MB)")
+    print(f"   Player: {player or MPV_BIN}\n")
+
+    try:
+        player_bin = player or MPV_BIN
+        proc = subprocess.run([player_bin, filepath],
+                              stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+        exit_code = proc.returncode
+    except FileNotFoundError:
+        print(f"❌ Player not found: {player or MPV_BIN}")
+        print(f"   Install mpv: sudo apt install mpv")
+        return False
+    except Exception as e:
+        print(f"❌ Failed to play: {e}")
+        return False
+
+    # After playback, ask to mark as watched
+    print(f"\n✅ Playback finished (exit code: {exit_code})")
+    try:
+        resp = input(f"  Mark as watched? [Y/n]: ").strip().lower()
+        if resp in ('', 'y', 'yes', 's', 'sim'):
+            # Extract episode number for DB update
+            ep_num = episode
+            if ep_num is None:
+                ep_m = re.search(r'S\d+E(\d+)', filepath)
+                if ep_m:
+                    ep_num = int(ep_m.group(1))
+                else:
+                    ep_m = re.search(r'(\d+)', os.path.basename(filepath).replace('-', ' '))
+                    ep_num = int(ep_m.group(1)) if ep_m else 0
+            update_progress_db(title, ep_num, filepath, mark_watched=True)
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="anime-dl-br — Download anime from Brazilian sources (AnimeFire, AnimesOnlineCC)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  anime-dl-br search "jujutsu kaisen"
+  anime-dl-br search "naruto" --source animesonline
+  anime-dl-br episodes jujutsu-kaisen-tv-todos-os-episodios
+  anime-dl-br download "Jujutsu Kaisen (TV)" 1
+  anime-dl-br download "Jujutsu Kaisen (TV)" --range 1-12
+  anime-dl-br download "Naruto" --all --source animesonline
+  anime-dl-br download "One Piece" 5 --quality 1080p --dir ~/Videos
+  anime-dl-br watch "Jujutsu Kaisen (TV)" 1
+  anime-dl-br watch "Jujutsu Kaisen"          # list and pick episode
+  anime-dl-br watch "Jujutsu Kaisen" 2 --player vlc
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command")
+
+    # ── Search ──
+    sp = subparsers.add_parser("search", help="Search anime on BR sources")
+    sp.add_argument("query", nargs="+", help="Anime name")
+    sp.add_argument("--source", choices=["animefire", "animesonline"],
+                    default="animefire", help="Source (default: animefire)")
+    sp.add_argument("--json", action="store_true", help="JSON output for scripting")
+
+    # ── Episodes ──
+    sp = subparsers.add_parser("episodes", help="List episodes")
+    sp.add_argument("slug", help="Anime slug from search results")
+    sp.add_argument("--source", choices=["animefire", "animesonline"],
+                    default="animefire", help="Source (default: animefire)")
+    sp.add_argument("--json", action="store_true", help="JSON output for scripting")
+
+    # ── Download ──
+    sp = subparsers.add_parser("download", help="Download episode(s)")
+    sp.add_argument("title", help="Anime name or slug")
+    sp.add_argument("episode", nargs="?", type=int, help="Episode number")
+    sp.add_argument("--range", "-r", help="Episode range (e.g. 1-12)")
+    sp.add_argument("--all", "-a", action="store_true", help="Download all episodes")
+    sp.add_argument("--max", type=int, default=0,
+                    help="Max episodes to download with --all (default: all)")
+    sp.add_argument("--source", choices=["animefire", "animesonline"],
+                    default="animefire", help="Source (default: animefire)")
+    sp.add_argument("--quality", "-q", choices=["best", "1080p", "720p", "480p", "360p"],
+                    default="best", help="Quality (default: best)")
+    sp.add_argument("--dir", "-d", default=None,
+                    help=f"Output dir (default: {DEFAULT_DOWNLOAD_DIR})")
+    sp.add_argument("--lang", default="pt-BR",
+                    help="Language (default: pt-BR)")
+    sp.add_argument("--embed-subs", action="store_true",
+                    help="Embed subtitles into video (yt-dlp --embed-subs)")
+    sp.add_argument("--no-track", action="store_true",
+                    help="Skip GoAnime DB update")
+
+    # ── Watch ──
+    sp = subparsers.add_parser("watch", help="Play downloaded episode with mpv")
+    sp.add_argument("title", help="Anime name (as in download dir)")
+    sp.add_argument("episode", nargs="?", type=int, help="Episode number (default: list)")
+    sp.add_argument("--player", "-p", default=None,
+                    help="Player command (default: mpv)")
+    sp.add_argument("--dir", "-d", default=None,
+                    help=f"Download dir (default: {DEFAULT_DOWNLOAD_DIR})")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    # ══════════════════════════════════════════════════════════════
+    #  SEARCH
+    # ══════════════════════════════════════════════════════════════
+    if args.command == "search":
+        query = " ".join(args.query)
+
+        actual_source = args.source
+        if args.source == "animefire":
+            results = search_animefire(query)
+            if not results:
+                # AnimeFire search endpoint may be unavailable; try animesonline as fallback
+                results = search_animesonline(query)
+                if results:
+                    actual_source = "animesonline"
+        else:
+            results = search_animesonline(query)
+
+        if args.json:
+            out = [{"slug": r["slug"], "title": r["title"], "source": actual_source} for r in results]
+            print(json.dumps(out))
+            return
+
+        if not results:
+            print(f"🔍 Searching '{query}' on {args.source}...")
+            print("❌ No results found")
+            return
+
+        print(f"🔍 Searching '{query}' on {args.source}...")
+        print(f"\n📺 {len(results)} result(s):")
+        print(f"{'#':<4} {'Slug':<55} {'Title':<60}")
+        print("-" * 120)
+        for i, r in enumerate(results, 1):
+            print(f"{i:<4} {r['slug'][:53]:<55} {r['title'][:58]:<60}")
+
+        print(f"\n💡 Use: anime-dl-br episodes <slug> --source {actual_source}")
+
+        # When results came from animesonline (fallback or user-specified),
+        # show likely AnimeFire slugs too
+        if actual_source == "animesonline":
+            print(f"\nℹ️  For AnimeFire download, try these slug patterns:")
+            for r in results[:3]:
+                guess = r['slug'].replace('-hd', '').replace('-todos-os-episodios', '')
+                # Common animefire slug patterns
+                for suffix in ['-tv', '-hd', '']:
+                    af_slug = f"{guess}{suffix}"
+                    print(f"     {af_slug:<45} --source animefire")
+            print(f"   Or just use: anime-dl-br download \"{query}\" <ep> --source animefire")
+
+    # ══════════════════════════════════════════════════════════════
+    #  EPISODES
+    # ══════════════════════════════════════════════════════════════
+    elif args.command == "episodes":
+        info = (get_animefire_episodes(args.slug) if args.source == "animefire"
+                else get_animesonline_episodes(args.slug))
+
+        if not info["episodes"]:
+            if args.json:
+                print(json.dumps({"title": info["title"], "episodes": [], "total_count": 0}))
+                return
+            print(f"📋 Getting episodes for '{args.slug}' on {args.source}...")
+            print("❌ No episodes found")
+            print("  💡 Verify the slug. Use 'search' first.")
+            return
+
+        title = info["title"]
+        eps = info["episodes"]
+        total = info["total_count"]
+
+        if args.json:
+            print(json.dumps({"title": title, "episodes": eps, "total_count": total}))
+            return
+
+        print(f"\n📺 {title}")
+        print(f"🎬 Total episodes: {total}\n")
+
+        for i in range(0, len(eps), 20):
+            group = eps[i:i+20]
+            nums = [str(e['num']) for e in group]
+            if len(nums) > 1:
+                print(f"  Episodes {group[0]['num']}-{group[-1]['num']}: ", end="")
+            else:
+                print(f"  Episode {nums[0]}: ", end="")
+            print(" ".join(nums))
+
+        print(f"\n💡 Use: anime-dl-br download \"{title}\" <ep> --source {args.source}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  DOWNLOAD
+    # ══════════════════════════════════════════════════════════════
+    elif args.command == "download":
+        title = args.title
+        output_dir = args.dir if args.dir else DEFAULT_DOWNLOAD_DIR
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Resolve slug and title
+        slug, resolved_title = resolve_anime(args.source, title)
+        if slug:
+            title = resolved_title
+        else:
+            # Use the title as-is — it might be a direct slug or name
+            slug = title.lower().replace(' ', '-')
+
+        # Build episode list
+        episodes_to_dl = []
+
+        if args.all:
+            info = (get_animefire_episodes(slug) if args.source == "animefire"
+                    else get_animesonline_episodes(slug))
+            if not info["episodes"]:
+                print(f"❌ No episodes found for '{title}'")
+                return
+            episodes_to_dl = [e["num"] for e in info["episodes"]]
+            if args.max > 0:
+                episodes_to_dl = episodes_to_dl[:args.max]
+                print(f"📥 Downloading first {args.max} of {info['total_count']} episodes of '{title}'")
+            else:
+                print(f"📥 Downloading ALL {len(episodes_to_dl)} episodes of '{title}'")
+
+        elif args.range:
+            parts = args.range.split('-')
+            start = int(parts[0])
+            end = int(parts[1]) if len(parts) > 1 else start
+            episodes_to_dl = list(range(start, end + 1))
+            print(f"📥 Downloading episodes {start}-{end} of '{title}'")
+
+        elif args.episode:
+            episodes_to_dl = [args.episode]
+            print(f"📥 Downloading episode {args.episode} of '{title}'")
+
+        else:
+            print("❌ Specify an episode number, --range, or --all")
+            return
+
+        print(f"   Source: {args.source} | Quality: {args.quality}")
+        print(f"   Output: {output_dir}\n")
+
+        success_count = 0
+        for ep in episodes_to_dl:
+            print(f"{'='*60}")
+            print(f"  📺 Episode {ep}")
+            print(f"{'='*60}")
+
+            if args.source == "animefire":
+                filepath = download_animefire(
+                    title, slug, ep, quality=args.quality,
+                    output_dir=output_dir, embed_subs=args.embed_subs
+                )
+            else:
+                filepath = download_animesonline(
+                    title, slug, ep, quality=args.quality,
+                    output_dir=output_dir, embed_subs=args.embed_subs
+                )
+
+            if filepath:
+                success_count += 1
+                if not args.no_track:
+                    update_progress_db(title, ep, filepath)
+            else:
+                print(f"  ❌ Failed to download episode {ep}")
+
+            print()
+
+        if success_count > 0:
+            print(f"✅ Downloaded {success_count}/{len(episodes_to_dl)} episodes")
+            dir_files = [f for f in os.listdir(output_dir)
+                        if f.endswith(('.mp4', '.mkv'))]
+            print(f"   📁 {output_dir}/ ({len(dir_files)} files)")
+
+            # Ask to watch the last downloaded episode (single episode mode)
+            if len(episodes_to_dl) == 1:
+                try:
+                    resp = input(f"\n  ▶️  Watch now? [y/N]: ").strip().lower()
+                    if resp in ('y', 'yes', 's', 'sim'):
+                        print()
+                        cmd_watch(title, episode=episodes_to_dl[0], download_dir=output_dir)
+                except (EOFError, KeyboardInterrupt):
+                    pass
+        else:
+            print(f"❌ No episodes were downloaded.")
+            sys.exit(1)
+
+    # ══════════════════════════════════════════════════════════════
+    #  WATCH
+    # ══════════════════════════════════════════════════════════════
+    elif args.command == "watch":
+        cmd_watch(args.title, episode=args.episode,
+                  player=args.player, download_dir=args.dir)
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "anime-dl-br"
+version = "2.0.0"
+description = "Download de animes de fontes brasileiras (AnimeFire, AnimesOnlineCC)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "curl-cffi>=0.7",
+]
+
+[project.optional-dependencies]
+playwright = [
+    "playwright>=1.40",
+]
+
+[project.scripts]
+anime-dl-br = "anime_dl_br:main"
