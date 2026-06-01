@@ -1,6 +1,6 @@
 # anime-dl-br
 
-Download de animes de fontes brasileiras (AnimeFire, AnimesOnlineCC) com integração ao sistema de tracking do [GoAnime](https://github.com/ismaeldouglasdev/goanime).
+Download de animes de fontes brasileiras (AnimeFire, AnimesOnlineCC).
 
 ## Funcionalidades
 
@@ -10,7 +10,7 @@ Download de animes de fontes brasileiras (AnimeFire, AnimesOnlineCC) com integra
 - 🧠 **Resolução inteligente de slugs** — se a busca no AnimeFire falha, tenta padrões comuns de slug automaticamente
 - 🔄 **Fallback automático** — se uma fonte não tem o episódio, tenta a outra
 - 🎥 **Player** — assiste episódios diretamente no terminal via mpv
-- 📊 **Integração GoAnime** — atualiza automaticamente o banco de tracking com episódios baixados
+- 📊 **Tracking** — registra episódios baixados no banco de histórico
 
 ## Instalação
 
@@ -71,11 +71,6 @@ anime-dl-br download "one-piece" --all --dir ~/Videos/Animes
 |-------|--------|-----------|
 | AnimeFire | ✅ Funcional | SD, HD, Full HD |
 | AnimesOnlineCC | ✅ Funcional (com fallback Blogger) | SD, HD |
-
-## Projetos Relacionados
-
-- [GoAnime](https://github.com/ismaeldouglasdev/goanime) — Gerenciador de tracking de animes assistidos
-- [goanime-next-br](https://github.com/ismaeldouglasdev/goanime-next-br) — Versão melhorada com interface interativa
 
 ## Licença
 
