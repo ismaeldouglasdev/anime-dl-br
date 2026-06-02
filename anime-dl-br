@@ -25,18 +25,35 @@ import sqlite3
 from urllib.parse import quote, urljoin
 from pathlib import Path
 
-# ── HTTP Session (curl_cffi > cloudscraper — same pattern as anime-dl) ──
-try:
-    from curl_cffi import requests
-    USE_CURL_CFFI = True
-except ImportError:
+# ── Termux (Android) Detection ───────────────────────────────────
+IN_TERMUX = os.environ.get('TERMUX_VERSION') is not None
+if IN_TERMUX:
+    # On Termux, storage access is via ~/storage/shared/
+    _termux_storage = os.path.expanduser("~/storage/shared")
+    _termux_downloads = os.path.join(_termux_storage, "Download", "Animes")
+    os.makedirs(_termux_downloads, exist_ok=True)
+
+# ── HTTP Session (cloudscraper preferred on Termux, curl_cffi elsewhere) ──
+if IN_TERMUX:
+    # curl_cffi rarely has ARM64 Linux wheels; use cloudscraper
     try:
         import cloudscraper
         USE_CURL_CFFI = False
     except ImportError:
-        print("ERROR: Need curl_cffi or cloudscraper. Install with:")
-        print("  pip install curl_cffi cloudscraper")
+        print("ERROR: Need cloudscraper. Run: pip install cloudscraper")
         sys.exit(1)
+else:
+    try:
+        from curl_cffi import requests
+        USE_CURL_CFFI = True
+    except ImportError:
+        try:
+            import cloudscraper
+            USE_CURL_CFFI = False
+        except ImportError:
+            print("ERROR: Need curl_cffi or cloudscraper. Install with:")
+            print("  pip install curl_cffi cloudscraper")
+            sys.exit(1)
 
 # ── Playwright (optional, for Blogger JS-based video extraction) ──
 try:
@@ -48,11 +65,21 @@ except ImportError:
 # ── Constants ─────────────────────────────────────────────────────
 ANIMEFIRE_BASE = "https://animefire.io"
 ANIMESONLINE_BASE = "https://animesonlinecc.to"
-GOANIME_BIN = os.path.expanduser("~/.local/bin/goanime")
-GOANIME_DB = os.path.expanduser("~/.local/goanime/tracking/progress.db")
-DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/.local/goanime/downloads/anime")
+if IN_TERMUX:
+    # Android paths
+    GOANIME_BIN = ""
+    GOANIME_DB = ""
+    DEFAULT_DOWNLOAD_DIR = _termux_downloads
+    # yt-dlp is installed via pkg on Termux
+    YT_DLP_BIN = shutil.which("yt-dlp") or "yt-dlp"
+    YT_DLP_OPTS = []
+else:
+    GOANIME_BIN = os.path.expanduser("~/.local/bin/goanime")
+    GOANIME_DB = os.path.expanduser("~/.local/goanime/tracking/progress.db")
+    DEFAULT_DOWNLOAD_DIR = os.path.expanduser("~/.local/goanime/downloads/anime")
+    YT_DLP_BIN = shutil.which("yt-dlp") or os.path.expanduser("~/.local/venv/anime/bin/yt-dlp")
+    YT_DLP_OPTS = []
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-YT_DLP_BIN = shutil.which("yt-dlp") or os.path.expanduser("~/.local/venv/anime/bin/yt-dlp")
 
 # ── Title cleanup ─────────────────────────────────────────────────
 
@@ -84,7 +111,11 @@ def http_get(session, url, **kwargs):
 
 # ── Slug Cache ──────────────────────────────────────────────────
 _SLUG_CACHE = {}
-_SLUG_CACHE_PATH = os.path.expanduser("~/.local/share/anime-dl-br/slug_cache.json")
+_SLUG_CACHE_PATH = os.path.expanduser(
+    "~/.local/share/anime-dl-br/slug_cache.json"
+    if not IN_TERMUX else
+    "~/.cache/anime-dl-br/slug_cache.json"
+)
 
 def _load_slug_cache():
     global _SLUG_CACHE
@@ -1130,7 +1161,10 @@ def resolve_anime(source, query):
 #  WATCH — Play downloaded episode
 # ═══════════════════════════════════════════════════════════════════
 
-MPV_BIN = shutil.which("mpv") or "/usr/bin/mpv"
+if IN_TERMUX:
+    MPV_BIN = shutil.which("mpv") or "termux-open"  # termux-open opens in system video player
+else:
+    MPV_BIN = shutil.which("mpv") or "/usr/bin/mpv"
 
 
 def cmd_watch(title, episode=None, player=None, download_dir=None):
@@ -1216,7 +1250,11 @@ def cmd_watch(title, episode=None, player=None, download_dir=None):
         exit_code = proc.returncode
     except FileNotFoundError:
         print(f"❌ Player not found: {player or MPV_BIN}")
-        print(f"   Install mpv: sudo apt install mpv")
+        if IN_TERMUX:
+            print(f"   Install mpv: pkg install mpv")
+            print(f"   Or use VLC: pkg install vlc-android")
+        else:
+            print(f"   Install mpv: sudo apt install mpv")
         return False
     except Exception as e:
         print(f"❌ Failed to play: {e}")
