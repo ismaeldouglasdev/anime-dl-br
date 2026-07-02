@@ -1,4 +1,8 @@
 # anime-dl-br
+<p align="center">
+  <strong>🇧🇷 Português</strong> &nbsp;|&nbsp; <a href="README.en.md">🇺🇸 English</a>
+</p>
+
 
 Download de animes de fontes brasileiras (AnimeFire, AnimesOnlineCC).
 Funciona no **PC (Linux)** e no **celular (Android via Termux)**.
